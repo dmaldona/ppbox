@@ -353,6 +353,61 @@ class NHPPFitter:
             
         return np.sort(valid_times)
     
+    def predict_intensity(self, times: np.ndarray) -> np.ndarray:
+        """
+        Predict intensity values at specified times using fitted model.
+        
+        Args:
+            times (np.ndarray): Times at which to predict intensity values.
+            
+        Returns:
+            np.ndarray: Predicted intensity values at specified times.
+            
+        Raises:
+            RuntimeError: If the model has not been fitted yet.
+        """
+        if self.fitted_params is None:
+            raise RuntimeError("Model has not been fitted yet.")
+        
+        # Calculate intensity values using fitted parameters
+        intensity_values = self._intensity_function(times, self.fitted_params)
+        
+        return intensity_values
+    
+    def calculate_transformed_interarrivals(self) -> np.ndarray:
+        """
+        Calculate transformed interarrival times for model diagnostics.
+        
+        For a correctly specified NHPP model, the transformed interarrival times
+        should follow an exponential distribution with unit mean (Exp(1)).
+        
+        Returns:
+            np.ndarray: Array of transformed interarrival times.
+            
+        Raises:
+            RuntimeError: If the model has not been fitted yet.
+        """
+        if self.fitted_params is None:
+            raise RuntimeError("Model has not been fitted yet.")
+        
+        if self.n_events == 0:
+            return np.array([])
+        
+        # Calculate cumulative intensity values at event times
+        tau_values = np.zeros(self.n_events)
+        for i, t_i in enumerate(self.event_times):
+            tau_values[i] = self._cumulative_intensity(t_i, self.fitted_params)
+        
+        # Check for NaNs or other issues
+        if np.any(np.isnan(tau_values)):
+            raise ValueError("Cumulative intensity calculation produced NaN values.")
+        
+        # Calculate interarrival times by taking differences
+        # Prepend 0 to represent start time (t=0)
+        deltas = np.diff(np.insert(tau_values, 0, 0.0))
+        
+        return deltas
+    
     @classmethod
     def create_with_log_linear_intensity(cls, 
                                         event_times: np.ndarray,
