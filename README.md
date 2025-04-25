@@ -14,18 +14,13 @@ A Python library for modeling and simulating Non-Homogeneous Poisson Processes (
 
 ## Requirements
 
-* numpy>=1.20.0 [cite: 2]
-* scipy>=1.7.0 [cite: 2]
+* numpy>=1.20.0
+* scipy>=1.7.0
 * matplotlib (for plotting)
 
 ## Installation
 
-(Provide installation instructions here, e.g., using pip if packaged)
-
-```bash
-# Example if packaged:
-# pip install ppbox 
-```
+Forthcoming
 
 ## Examples
 
