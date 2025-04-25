@@ -89,5 +89,5 @@ if log_linear_model.fitted_params is not None:
 * `src/ppbox/nhpp_fitter.py`: Core `NHPPFitter` class for modeling and simulation.
 * `src/ppbox/intensity_functions.py`: Defines intensity function classes (`LinearIntensity`, `LogLinearIntensity`).
 * `src/ppbox/nhpp_plotting.py`: Utility functions for visualization.
-* `tests/`: Unit and integration tests. [cite: 1]
+* `tests/`: Unit and integration tests.
 * `examples/`: Usage examples.
