@@ -183,3 +183,86 @@ def test_calculate_transformed_interarrivals_unfitted():
     # Check that calculate_transformed_interarrivals raises RuntimeError
     with pytest.raises(RuntimeError, match="Model has not been fitted yet"):
         model.calculate_transformed_interarrivals()
+
+def test_calculate_normalized_transformed_times_hpp(simulated_hpp_model):
+    """Test normalized transformed times for HPP."""
+    model = simulated_hpp_model
+    n = model.n_events
+    T = model.end_time
+
+    # Calculate normalized transformed times using the model's method
+    U_model = model.calculate_normalized_transformed_times()
+
+    # Check basic properties
+    assert len(U_model) == n
+    assert np.all(U_model >= 0) and np.all(U_model <= 1)
+    assert np.all(np.diff(U_model) >= 0) # Should be sorted
+
+    # For HPP, Lambda(t) = rate * t, Lambda(T) = rate * T
+    # So U_i = Lambda(S_i) / Lambda(T) = (rate * S_i) / (rate * T) = S_i / T
+    U_expected_hpp = model.event_times / T
+
+    # Compare model calculation with direct calculation for HPP
+    assert np.allclose(U_model, U_expected_hpp, rtol=1e-3)
+
+    # Check if they resemble Uniform(0, 1) order statistics
+    # Expected values are k / (n + 1)
+    expected_order_stats = np.arange(1, n + 1) / (n + 1.0)
+
+    # Check correlation between observed U_model and expected order stats
+    if n > 1:
+        corr = np.corrcoef(U_model, expected_order_stats)[0, 1]
+        assert corr > 0.95, f"Correlation {corr} too low between observed and expected U(0,1) order stats"
+
+    # Check mean (should be close to 0.5)
+    mean_U = np.mean(U_model)
+    assert np.isclose(mean_U, 0.5, atol=0.15), f"Mean {mean_U} not close to 0.5"
+
+
+def test_calculate_normalized_transformed_times_linear(simulated_linear_model):
+    """Test normalized transformed times for Linear Intensity model."""
+    model = simulated_linear_model
+    n = model.n_events
+
+    # Calculate normalized transformed times using the model's method
+    U_model = model.calculate_normalized_transformed_times()
+
+    # Check basic properties
+    assert len(U_model) == n
+    assert np.all(U_model >= 0) and np.all(U_model <= 1)
+    if n > 0:
+        assert np.all(np.diff(U_model) >= -1e-9) # Allow for small numerical errors in sorting
+
+    # Check if they resemble Uniform(0, 1) order statistics
+    expected_order_stats = np.arange(1, n + 1) / (n + 1.0)
+
+    # Check correlation
+    if n > 1:
+        corr = np.corrcoef(U_model, expected_order_stats)[0, 1]
+        assert corr > 0.95, f"Correlation {corr} too low between observed and expected U(0,1) order stats"
+
+    # Check mean
+    mean_U = np.mean(U_model)
+    assert np.isclose(mean_U, 0.5, atol=0.15), f"Mean {mean_U} not close to 0.5"
+
+
+def test_calculate_normalized_transformed_times_empty():
+    """Test calculation of normalized transformed times with no events."""
+    model = NHPPFitter.create_with_linear_intensity(
+        event_times=np.array([]),
+        end_time=10.0
+    )
+    model.fitted_params = np.array([0.1, 0.01]) # Assign params manually
+    U_model = model.calculate_normalized_transformed_times()
+    assert isinstance(U_model, np.ndarray)
+    assert len(U_model) == 0
+
+
+def test_calculate_normalized_transformed_times_unfitted():
+    """Test that calculate_normalized_transformed_times raises error when model is not fitted."""
+    model = NHPPFitter.create_with_linear_intensity(
+        event_times=np.array([1.0, 2.0, 3.0]),
+        end_time=10.0
+    )
+    with pytest.raises(RuntimeError, match="Model has not been fitted yet"):
+        model.calculate_normalized_transformed_times()

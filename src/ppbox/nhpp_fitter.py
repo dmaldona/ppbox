@@ -407,6 +407,60 @@ class NHPPFitter:
         deltas = np.diff(np.insert(tau_values, 0, 0.0))
         
         return deltas
+
+    def calculate_normalized_transformed_times(self) -> np.ndarray:
+        """
+        Calculate normalized transformed event times for diagnostics.
+
+        Computes U_i = Lambda(S_i) / Lambda(T), where S_i are event times
+        and T is the end_time. Under the correct model, these should be
+        distributed as order statistics from a Uniform(0, 1) distribution.
+
+        Returns:
+            np.ndarray: Array of normalized transformed event times U_i.
+
+        Raises:
+            RuntimeError: If the model has not been fitted yet.
+            ValueError: If cumulative intensity calculations fail.
+        """
+        if self.fitted_params is None:
+            raise RuntimeError("Model has not been fitted yet.")
+
+        if self.n_events == 0:
+            return np.array([])
+
+        # Calculate cumulative intensity at end time Lambda(T)
+        lambda_T = self._cumulative_intensity(self.end_time, self.fitted_params)
+        if lambda_T <= 0 or np.isnan(lambda_T) or np.isinf(lambda_T):
+            warnings.warn(f"Total cumulative intensity Lambda(T) = {lambda_T} is invalid. Cannot normalize.")
+            # Return empty or handle error appropriately, maybe raise ValueError
+            return np.array([]) 
+
+        # Calculate cumulative intensity values at each event time Lambda(S_i)
+        tau_values = np.zeros(self.n_events)
+        for i, t_i in enumerate(self.event_times):
+            tau_values[i] = self._cumulative_intensity(t_i, self.fitted_params)
+
+        # Check for NaNs or other issues in individual Lambda(S_i)
+        if np.any(np.isnan(tau_values)) or np.any(tau_values < 0):
+            # Handle potential issues from _cumulative_intensity
+            valid_mask = ~np.isnan(tau_values) & (tau_values >= 0)
+            if not np.all(valid_mask):
+                warnings.warn("Some cumulative intensity values at event times were invalid.")
+                # Decide how to proceed: filter or raise error
+                # For now, filter, but raising might be better
+                tau_values = tau_values[valid_mask]
+                if len(tau_values) == 0:
+                    return np.array([])
+
+
+        # Normalize: U_i = Lambda(S_i) / Lambda(T)
+        normalized_times = tau_values / lambda_T
+
+        # Ensure values are within [0, 1] due to potential numerical inaccuracies
+        normalized_times = np.clip(normalized_times, 0.0, 1.0)
+
+        return np.sort(normalized_times) # Ensure sorted
     
     @classmethod
     def create_with_log_linear_intensity(cls, 

@@ -378,6 +378,71 @@ def plot_multiple_intensities(models: List[NHPPFitter],
     
     return ax
 
+def plot_uniform_order_statistic(model: NHPPFitter,
+                                ax=None,
+                                **plot_kwargs) -> plt.Axes:
+    """
+    Plot normalized transformed times against expected Uniform(0,1) order statistics.
+
+    This diagnostic plot compares Lambda(S_i)/Lambda(T) against their
+    expected values k/(n+1) under the Uniform(0,1) order statistic assumption.
+    Points close to the y=x line suggest a good model fit.
+
+    Args:
+        model (NHPPFitter): A fitted NHPP model.
+        ax (matplotlib.axes.Axes, optional): Axes to plot on. If None, a new figure/axes is created.
+        **plot_kwargs: Additional keyword arguments passed to ax.plot for the points.
+
+    Returns:
+        matplotlib.axes.Axes: The axes containing the plot.
+
+    Raises:
+        RuntimeError: If the model has not been fitted.
+        ValueError: If calculation of normalized times fails or yields no points.
+    """
+    if model.fitted_params is None:
+        raise RuntimeError("Model has not been fitted yet.")
+
+    # Calculate observed normalized transformed times
+    observed_U = model.calculate_normalized_transformed_times()
+    n = len(observed_U)
+
+    if n < 1:
+        warnings.warn("Not enough events for Uniform Order Statistic plot.")
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 8))
+        ax.text(0.5, 0.5, 'Not enough events for plot', horizontalalignment='center', verticalalignment='center')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        return ax
+
+    # Calculate expected values for U(0,1) order statistics: E[U_(k)] = k / (n + 1)
+    expected_U = np.arange(1, n + 1) / (n + 1.0)
+
+    # Create figure/axes if not provided
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Create the scatter plot
+    plot_defaults = {'marker': 'o', 'linestyle': 'none', 'alpha': 0.7, 'markersize': 6}
+    plot_defaults.update(plot_kwargs) # Allow user overrides
+    ax.plot(expected_U, observed_U, **plot_defaults)
+
+    # Add y=x reference line
+    ax.plot([0, 1], [0, 1], color='r', linestyle='--', linewidth=1.5, label='y=x line')
+
+    # Customize plot appearance
+    ax.set_title("Uniform Order Statistic Diagnostic Plot", fontsize=14)
+    ax.set_xlabel("Expected $U(0,1)$ Order Statistics ($k/(n+1)$)", fontsize=12)
+    ax.set_ylabel("Observed Normalized Transformed Times ($\\Lambda(S_k)/\\Lambda(T)$)", fontsize=12)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect('equal', adjustable='box') # Ensure square plot for y=x line clarity
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.legend()
+
+    return ax
+
 
 def create_diagnostic_plots(model: NHPPFitter, figsize: Tuple[float, float] = (12, 10)) -> plt.Figure:
     """

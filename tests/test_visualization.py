@@ -13,7 +13,8 @@ from ppbox.nhpp_plotting import (
     plot_cumulative_intensity,
     plot_residual_histogram,
     plot_multiple_intensities,
-    create_diagnostic_plots
+    create_diagnostic_plots,
+    plot_uniform_order_statistic
 )
 
 
@@ -82,6 +83,15 @@ def unfitted_model():
         end_time=end_time
     )
     
+    return model
+
+@pytest.fixture
+def model_with_few_events():
+    """Fixture providing a model with only one event."""
+    event_times = np.array([5.0])
+    end_time = 10.0
+    model = NHPPFitter.create_with_linear_intensity(event_times, end_time)
+    model.fitted_params = np.array([0.1, 0.01]) # Manually set params
     return model
 
 
@@ -257,3 +267,45 @@ def test_create_diagnostic_plots_unfitted_model(unfitted_model):
     """Test that create_diagnostic_plots raises an error for unfitted models."""
     with pytest.raises(RuntimeError, match="Model not fitted"):
         create_diagnostic_plots(unfitted_model)
+
+def test_plot_uniform_order_statistic(fitted_linear_model):
+    """Test the plot_uniform_order_statistic function."""
+    fig, ax = plt.subplots()
+
+    # Run the plotting function
+    result_ax = plot_uniform_order_statistic(fitted_linear_model, ax=ax)
+
+    # Check basics
+    assert result_ax is ax
+    if fitted_linear_model.n_events >= 1:
+        # Expect scatter points and y=x line
+        assert len(ax.lines) >= 2
+        assert ax.get_xlabel() == "Expected $U(0,1)$ Order Statistics ($k/(n+1)$)"
+        assert ax.get_ylabel() == "Observed Normalized Transformed Times ($\\Lambda(S_k)/\\Lambda(T)$)"
+        assert "Uniform Order Statistic" in ax.get_title()
+        assert ax.get_legend() is not None # Check legend exists
+    else:
+        # Check if placeholder text is added for no events
+        assert len(ax.texts) > 0
+        assert 'Not enough events' in ax.texts[0].get_text()
+
+
+    plt.close(fig)
+
+
+def test_plot_uniform_order_statistic_unfitted(unfitted_model):
+    """Test plot_uniform_order_statistic raises error for unfitted model."""
+    fig, ax = plt.subplots()
+    with pytest.raises(RuntimeError, match="Model has not been fitted yet"):
+        plot_uniform_order_statistic(unfitted_model, ax=ax)
+    plt.close(fig)
+
+
+def test_plot_uniform_order_statistic_few_events(model_with_few_events):
+    """Test plot_uniform_order_statistic handles few events gracefully."""
+    fig, ax = plt.subplots()
+    # Should run without error and plot the single point
+    result_ax = plot_uniform_order_statistic(model_with_few_events, ax=ax)
+    assert result_ax is ax
+    assert len(ax.lines) >= 2 # Point + y=x line
+    plt.close(fig)
