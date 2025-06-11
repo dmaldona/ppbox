@@ -1,4 +1,7 @@
 import numpy as np
+import pandas as pd
+import copy
+from tqdm.auto import tqdm
 import scipy.optimize
 import scipy.integrate
 import warnings
@@ -31,7 +34,8 @@ class NHPPFitter:
                  event_times: np.ndarray,
                  intensity_function: IntensityFunction,
                  end_time: float,
-                 grid_size: int = 1000) -> None:
+                 grid_size: int = 1000,
+                 discrete_time = False) -> None:
         """
         Initialize the NHPP model.
         
@@ -46,7 +50,10 @@ class NHPPFitter:
         """
         # Ensure event_times is an array, even if empty
         event_times = np.asarray(event_times)
-        
+
+        # Store likelihood calculation mode
+        self.discrete_time = discrete_time
+
         # Filter and sort event times
         self.event_times = np.sort(event_times[(event_times >= 0) & (event_times <= end_time)])
         self.n_events = len(self.event_times)
@@ -113,13 +120,24 @@ class NHPPFitter:
         
         # 2. Integral term - use trapezoid rule
         try:
-            lambda_grid = self._intensity_function(self.time_grid, params)
-            integral_lambda = np.trapz(lambda_grid, self.time_grid)
+            if self.discrete_time:
+                # Assume λ(t) is constant within each unit interval [i-1, i)
+                # Sum from i=1 to floor(end_time)
+                discrete_times = np.arange(1, int(np.floor(self.end_time)) + 1)
+                if len(discrete_times) > 0:
+                    lambda_discrete = self._intensity_function(discrete_times, params)
+                    integral_lambda = np.sum(lambda_discrete)
+                else:
+                    integral_lambda = 0.0
+            else:
+                # Original continuous integration using trapezoid rule
+                lambda_grid = self._intensity_function(self.time_grid, params)
+                integral_lambda = np.trapz(lambda_grid, self.time_grid)
             
             if np.isnan(integral_lambda) or np.isinf(integral_lambda):
                 warnings.warn(f"Integral calculation resulted in {integral_lambda} for params {params}")
                 return np.inf
-                
+        
         except Exception as e:
             warnings.warn(f"Error during integration for params {params}: {e}")
             return np.inf
@@ -462,13 +480,275 @@ class NHPPFitter:
 
         return np.sort(normalized_times) # Ensure sorted
     
+    def bootstrap_parameter_uncertainty(self,
+                                        num_replicates: int = 100,
+                                        fit_method: str = 'BFGS',
+                                        fit_options: Optional[Dict[str, Any]] = None,
+                                        show_progress: bool = True,
+                                        random_seed: Optional[int] = None) -> pd.DataFrame:
+        """
+        Estimate parameter uncertainty using parametric bootstrap.
+
+        This method performs the following steps:
+        1. Simulates multiple event datasets from the currently fitted model.
+        2. Refits the model to each simulated dataset.
+        3. Collects the parameter estimates from these refits.
+        4. Returns the collection of bootstrap parameter estimates.
+
+        Args:
+            num_replicates (int, optional): Number of bootstrap datasets to generate.
+                Defaults to 100.
+            fit_method (str, optional): Optimization method used for fitting bootstrap models.
+                Defaults to 'BFGS'.
+            fit_options (Optional[Dict[str, Any]], optional): Options passed to the optimizer
+                for bootstrap fits. Defaults to None (typically {'disp': False}).
+            show_progress (bool, optional): Whether to display a progress bar.
+                Defaults to True (requires tqdm).
+            random_seed (Optional[int], optional): Seed for reproducibility of simulations.
+                Defaults to None.
+
+        Returns:
+            pd.DataFrame: A pandas DataFrame where each row corresponds to a successful
+                bootstrap replicate and columns correspond to the fitted parameters.
+                Returns an empty DataFrame if the original model is not fitted or
+                if no bootstrap replicates succeed.
+
+        Raises:
+            RuntimeError: If the model has not been fitted yet.
+            ImportError: If show_progress is True and tqdm is not installed.
+        """
+        if self.fitted_params is None:
+            raise RuntimeError("Model must be fitted before running bootstrap.")
+
+        if show_progress:
+            try:
+                from tqdm.auto import tqdm
+            except ImportError:
+                raise ImportError("tqdm must be installed to show progress bar. "
+                                  "Install with 'pip install tqdm' or set show_progress=False.")
+
+        if random_seed is not None:
+            np.random.seed(random_seed)
+
+        original_params = self.fitted_params
+        param_names = self.intensity_function.get_param_names()
+        bootstrap_estimates = []
+
+        # Default fit options for bootstrap (usually non-verbose)
+        if fit_options is None:
+            fit_options = {'disp': False}
+        else:
+            # Ensure verbosity is off unless explicitly requested
+            fit_options.setdefault('disp', False)
+
+        # Determine how to create new instances for refitting
+        # This needs access to the original configuration
+        # We assume the intensity_function object carries necessary config
+        # (like covariate data in LogLinearIntensity)
+        intensity_func_config = self.intensity_function # Assumes state (covariates) is here
+
+        iterator = range(num_replicates)
+        if show_progress:
+            iterator = tqdm(iterator, desc="Bootstrap Replicates")
+
+        successful_fits = 0
+        for _ in iterator:
+            # 1. Simulate new data from the fitted model
+            simulated_event_times = self.simulate(sim_params=original_params,
+                                                  duration=self.end_time)
+
+            # 2. Create a new fitter instance for the simulated data
+            # We need to ensure the new instance has the same intensity function type
+            # and configuration (like covariates, end_time).
+            # A simple way is to create a new instance using the stored intensity function object.
+            # This assumes the intensity function object is self-contained or can be deep-copied.
+            try:
+                # Attempt to deepcopy the intensity function to avoid side effects if it's mutable
+                current_intensity_func = copy.deepcopy(intensity_func_config)
+            except TypeError:
+                 # If deepcopy fails (e.g., for complex objects), use the original reference cautiously
+                 # or implement a specific clone/factory method later.
+                 current_intensity_func = intensity_func_config
+                 warnings.warn("Could not deepcopy intensity function; using original reference.")
+
+            bootstrap_fitter = NHPPFitter(
+                event_times=simulated_event_times,
+                intensity_function=current_intensity_func,
+                end_time=self.end_time,
+                grid_size=self.grid_size # Use same grid size
+            )
+
+            # 3. Fit the model to the simulated data
+            # Use original fitted parameters as initial guess for speed/stability
+            try:
+                result = bootstrap_fitter.fit(
+                    initial_params=original_params,
+                    method=fit_method,
+                    options=fit_options,
+                    verbose=False # Ensure verbose is off for bootstrap fits
+                )
+
+                # 4. Store results if successful
+                if result.success and bootstrap_fitter.fitted_params is not None:
+                    bootstrap_estimates.append(bootstrap_fitter.fitted_params)
+                    successful_fits += 1
+                # Optional: Add logging here for failed fits if desired
+
+            except Exception as e:
+                # Catch potential errors during fitting on simulated data
+                warnings.warn(f"Bootstrap replicate fit failed with error: {e}")
+                continue # Skip to the next replicate
+
+        if show_progress:
+             print(f"Bootstrap completed. {successful_fits}/{num_replicates} fits succeeded.")
+
+        if not bootstrap_estimates:
+            warnings.warn("No bootstrap replicates succeeded.")
+            return pd.DataFrame(columns=param_names)
+
+        # Convert results to DataFrame
+        bootstrap_df = pd.DataFrame(bootstrap_estimates, columns=param_names)
+
+        return bootstrap_df
+
+    def get_parameter_summary(self, bootstrap_results: Optional[pd.DataFrame] = None,
+                              num_replicates: int = 100,
+                              alpha: float = 0.05,
+                              **bootstrap_kwargs) -> Optional[pd.DataFrame]:
+        """
+        Provides a summary table of parameters including MLE estimates,
+        bootstrap standard errors, and confidence intervals.
+
+        Args:
+            bootstrap_results (Optional[pd.DataFrame], optional): Pre-computed bootstrap
+                results from bootstrap_parameter_uncertainty(). If None, bootstrap
+                will be run first. Defaults to None.
+            num_replicates (int, optional): Number of replicates if bootstrap needs to be run.
+                Defaults to 100.
+            alpha (float, optional): Significance level for confidence intervals (e.g., 0.05 for 95% CI).
+                 Defaults to 0.05.
+            **bootstrap_kwargs: Additional keyword arguments passed to
+                 bootstrap_parameter_uncertainty if it needs to be run.
+
+        Returns:
+            Optional[pd.DataFrame]: A DataFrame summarizing parameter estimates and uncertainty,
+                 or None if the model is not fitted or bootstrap fails.
+        """
+        if self.fitted_params is None:
+            print("Model is not fitted.")
+            return None
+
+        if bootstrap_results is None:
+            print(f"Running bootstrap with {num_replicates} replicates...")
+            bootstrap_results = self.bootstrap_parameter_uncertainty(
+                num_replicates=num_replicates,
+                **bootstrap_kwargs
+            )
+
+        if bootstrap_results is None or bootstrap_results.empty:
+            print("Bootstrap failed or yielded no successful replicates.")
+            return None
+
+        # Calculate summary statistics
+        mle_series = pd.Series(self.fitted_params, index=bootstrap_results.columns, name='MLE_Estimate')
+        mean_series = bootstrap_results.mean().rename('Bootstrap_Mean')
+        std_series = bootstrap_results.std().rename('Bootstrap_StdErr')
+
+        # Calculate percentile confidence intervals
+        lower_quantile = alpha / 2.0
+        upper_quantile = 1.0 - lower_quantile
+        lower_ci = bootstrap_results.quantile(lower_quantile).rename(f'CI_{lower_quantile*100:.1f}%')
+        upper_ci = bootstrap_results.quantile(upper_quantile).rename(f'CI_{upper_quantile*100:.1f}%')
+
+        # Combine into a summary DataFrame
+        summary_df = pd.concat([mle_series, mean_series, std_series, lower_ci, upper_ci], axis=1)
+
+        return summary_df
+    
+    def calculate_empirical_rates_disjoint(self, 
+                                        interval_length: Optional[float] = None,
+                                        num_intervals: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Calculate empirical rates using disjoint intervals.
+        
+        Args:
+            interval_length: Length of each interval. If None, calculated from num_intervals.
+            num_intervals: Number of intervals. If None, calculated from interval_length.
+            
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: (time_points, empirical_rates)
+        """
+        if interval_length is None and num_intervals is None:
+            raise ValueError("Either interval_length or num_intervals must be specified")
+        if interval_length is not None and num_intervals is not None:
+            raise ValueError("Only one of interval_length or num_intervals can be specified")
+        
+        if interval_length is None:
+            interval_length = self.end_time / num_intervals
+        else:
+            num_intervals = int(np.ceil(self.end_time / interval_length))
+        
+        # Create interval boundaries
+        intervals = np.linspace(0, self.end_time, num_intervals + 1)
+        time_points = (intervals[:-1] + intervals[1:]) / 2  # Midpoints
+        empirical_rates = np.zeros(num_intervals)
+        
+        # Calculate empirical rate for each interval
+        for i in range(num_intervals):
+            start_time = intervals[i]
+            end_time = intervals[i + 1]
+            
+            # Count events in this interval
+            events_in_interval = np.sum((self.event_times >= start_time) & 
+                                    (self.event_times < end_time))
+            
+            # Calculate rate
+            empirical_rates[i] = events_in_interval / (end_time - start_time)
+        
+        return time_points, empirical_rates
+
+    def calculate_empirical_rates_overlapping(self, 
+                                            interval_length: float,
+                                            resolution: int = 100) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Calculate empirical rates using overlapping intervals (sliding window).
+        
+        Args:
+            interval_length: Length of the sliding window.
+            resolution: Number of time points to evaluate at.
+            
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: (time_points, empirical_rates)
+        """
+        # Create time points for evaluation
+        time_points = np.linspace(interval_length/2, 
+                                self.end_time - interval_length/2, 
+                                resolution)
+        empirical_rates = np.zeros(len(time_points))
+        
+        # Calculate empirical rate at each time point
+        for i, t in enumerate(time_points):
+            start_time = max(0, t - interval_length/2)
+            end_time = min(self.end_time, t + interval_length/2)
+            
+            # Count events in this interval
+            events_in_interval = np.sum((self.event_times >= start_time) & 
+                                    (self.event_times < end_time))
+            
+            # Calculate rate
+            actual_length = end_time - start_time
+            empirical_rates[i] = events_in_interval / actual_length
+        
+        return time_points, empirical_rates
+    
     @classmethod
     def create_with_log_linear_intensity(cls, 
                                         event_times: np.ndarray,
                                         covariate_times: np.ndarray,
                                         covariate_values: np.ndarray,
                                         end_time: float,
-                                        grid_size: int = 1000) -> 'NHPPFitter':
+                                        grid_size: int = 1000,
+                                        discrete_time: bool = False) -> 'NHPPFitter':
         """
         Factory method to create an NHPPFitter with LogLinearIntensity.
         
@@ -492,14 +772,16 @@ class NHPPFitter:
             event_times=event_times,
             intensity_function=intensity,
             end_time=end_time,
-            grid_size=grid_size
+            grid_size=grid_size,
+            discrete_time=discrete_time
         )
     
     @classmethod
     def create_with_linear_intensity(cls,
                                     event_times: np.ndarray,
                                     end_time: float,
-                                    grid_size: int = 1000) -> 'NHPPFitter':
+                                    grid_size: int = 1000,
+                                    discrete_time: bool = False) -> 'NHPPFitter':
         """
         Factory method to create an NHPPFitter with LinearIntensity.
         
@@ -516,5 +798,6 @@ class NHPPFitter:
             event_times=event_times,
             intensity_function=intensity,
             end_time=end_time,
-            grid_size=grid_size
+            grid_size=grid_size,
+            discrete_time=discrete_time  # ADD THIS LINE
         )

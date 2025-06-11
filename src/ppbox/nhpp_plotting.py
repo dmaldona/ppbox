@@ -493,3 +493,69 @@ def create_diagnostic_plots(model: NHPPFitter, figsize: Tuple[float, float] = (1
     fig.subplots_adjust(top=0.92)
     
     return fig
+
+def plot_empirical_vs_fitted_rates(model: NHPPFitter,
+                                   method: str = 'disjoint',
+                                   interval_length: Optional[float] = None,
+                                   num_intervals: Optional[int] = None,
+                                   resolution: int = 100,
+                                   ax=None,
+                                   **plot_kwargs) -> plt.Axes:
+    """
+    Plot empirical rates vs fitted intensity function.
+    
+    Args:
+        model: Fitted NHPP model.
+        method: 'disjoint' or 'overlapping'.
+        interval_length: Length of intervals for rate calculation.
+        num_intervals: Number of intervals (for disjoint method only).
+        resolution: Number of points for fitted intensity evaluation.
+        ax: Matplotlib axes.
+        
+    Returns:
+        matplotlib.axes.Axes: The axes containing the plot.
+    """
+    if model.fitted_params is None:
+        raise RuntimeError("Model not fitted.")
+    
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Calculate empirical rates
+    if method == 'disjoint':
+        if interval_length is None and num_intervals is None:
+            num_intervals = min(20, max(5, model.n_events // 3))  # Default heuristic
+        emp_times, emp_rates = model.calculate_empirical_rates_disjoint(
+            interval_length=interval_length, num_intervals=num_intervals)
+        plot_type = 'step'
+    elif method == 'overlapping':
+        if interval_length is None:
+            interval_length = model.end_time / 10  # Default heuristic
+        emp_times, emp_rates = model.calculate_empirical_rates_overlapping(
+            interval_length=interval_length, resolution=resolution)
+        plot_type = 'line'
+    else:
+        raise ValueError("method must be 'disjoint' or 'overlapping'")
+    
+    # Plot empirical rates
+    if plot_type == 'step':
+        ax.step(emp_times, emp_rates, where='mid', 
+                label='Empirical Rate', color='black', alpha=0.7)
+    else:
+        ax.plot(emp_times, emp_rates, 
+                label='Empirical Rate', color='black', alpha=0.7)
+    
+    # Plot fitted intensity
+    t_fitted = np.linspace(0, model.end_time, resolution)
+    fitted_intensity = model.predict_intensity(t_fitted)
+    ax.plot(t_fitted, fitted_intensity, 
+            label='Fitted Intensity', color='red', linewidth=2)
+    
+    # Formatting
+    ax.set_xlabel("Time", fontsize=12)
+    ax.set_ylabel("Rate / Intensity", fontsize=12)
+    ax.set_title(f"Empirical vs Fitted Rates ({method.title()} Method)", fontsize=14)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    return ax
