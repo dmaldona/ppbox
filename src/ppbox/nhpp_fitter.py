@@ -755,7 +755,9 @@ class NHPPFitter:
         Args:
             event_times (np.ndarray): Array of observed event times.
             covariate_times (np.ndarray): Times at which covariate is measured.
-            covariate_values (np.ndarray): Covariate values at measurement times.
+            covariate_values (np.ndarray): Covariate values. Can be:
+                - 1D array for single covariate
+                - 2D array (n_times, n_covariates) for multiple covariates
             end_time (float): End time of observation window.
             grid_size (int, optional): Size of grid for integration. Defaults to 1000.
             

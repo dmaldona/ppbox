@@ -144,36 +144,40 @@ class LogLinearIntensity(IntensityFunction):
     """
     
     def __init__(self, 
-                 covariate_times: np.ndarray, 
-                 covariate_values: np.ndarray, 
-                 end_time: float,
-                 grid_size: int = 1000) -> None:
+                covariate_times: np.ndarray, 
+                covariate_values: np.ndarray, 
+                end_time: float,
+                grid_size: int = 1000) -> None:
         """
         Initialize the LogLinearIntensity function.
         
         Args:
-            covariate_times (np.ndarray): Times at which covariate is measured.
-            covariate_values (np.ndarray): Covariate values at measurement times.
+            covariate_times (np.ndarray): Times at which covariates are measured.
+            covariate_values (np.ndarray): Covariate values. Can be:
+                - 1D array for single covariate
+                - 2D array (n_times, n_covariates) for multiple covariates
             end_time (float): End of observation period.
-            grid_size (int, optional): Size of pre-computed grid for faster interpolation.
-                Defaults to 1000.
-                
-        Raises:
-            ValueError: If covariate_times and covariate_values have different lengths.
-            ValueError: If covariate data is empty.
+            grid_size (int, optional): Size of pre-computed grid. Defaults to 1000.
         """
-        if len(covariate_times) != len(covariate_values):
-            raise ValueError("covariate_times and covariate_values must have the same length")
+        # Convert to 2D array for consistent handling
+        covariate_values = np.atleast_2d(covariate_values)
+        if covariate_values.shape[0] == 1 and len(covariate_times) > 1:
+            # Handle case where single covariate was passed as row vector
+            covariate_values = covariate_values.T
+        
+        if len(covariate_times) != covariate_values.shape[0]:
+            raise ValueError("covariate_times and covariate_values must have compatible dimensions")
         if len(covariate_times) == 0:
             raise ValueError("Covariate data cannot be empty")
         
         # Store sorted covariate data
         idx = np.argsort(covariate_times)
         self.covariate_times = covariate_times[idx]
-        self.covariate_values = covariate_values[idx]
+        self.covariate_values = covariate_values[idx, :]
+        self.n_covariates = covariate_values.shape[1]
         self.end_time = end_time
         
-        # Check if observation interval is covered by covariate data
+        # Check coverage
         if self.covariate_times[0] > 0 or self.covariate_times[-1] < self.end_time:
             warnings.warn(f"Covariate range [{self.covariate_times[0]}, {self.covariate_times[-1]}] "
                         f"does not fully cover [0, {self.end_time}]. Extrapolation may occur.")
@@ -187,19 +191,29 @@ class LogLinearIntensity(IntensityFunction):
         """
         Interpolate covariate values at time(s) t.
         
-        Args:
-            t (Union[float, np.ndarray]): Time point(s) at which to interpolate.
-            
         Returns:
             Union[float, np.ndarray]: Interpolated covariate value(s).
+                For multiple covariates, returns array of shape (len(t), n_covariates)
         """
-        return np.interp(
-            t,
-            self.covariate_times,
-            self.covariate_values,
-            left=self.covariate_values[0],
-            right=self.covariate_values[-1]
-        )
+        if self.n_covariates == 1:
+            # Single covariate - return 1D
+            return np.interp(t, self.covariate_times, self.covariate_values[:, 0],
+                            left=self.covariate_values[0, 0], right=self.covariate_values[-1, 0])
+        else:
+            # Multiple covariates - interpolate each one
+            if np.isscalar(t):
+                result = np.zeros(self.n_covariates)
+                for i in range(self.n_covariates):
+                    result[i] = np.interp(t, self.covariate_times, self.covariate_values[:, i],
+                                        left=self.covariate_values[0, i], right=self.covariate_values[-1, i])
+                return result
+            else:
+                t = np.asarray(t)
+                result = np.zeros((len(t), self.n_covariates))
+                for i in range(self.n_covariates):
+                    result[:, i] = np.interp(t, self.covariate_times, self.covariate_values[:, i],
+                                        left=self.covariate_values[0, i], right=self.covariate_values[-1, i])
+                return result
     
     def get_covariate_at_time(self, t: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
         """
@@ -224,56 +238,46 @@ class LogLinearIntensity(IntensityFunction):
     
     def evaluate(self, t: Union[float, np.ndarray], params: np.ndarray) -> Union[float, np.ndarray]:
         """
-        Evaluate the intensity function λ(t) = exp(β₀ + β₁w(t)).
+        Evaluate the intensity function λ(t) = exp(β₀ + Σᵢ βᵢwᵢ(t)).
         
         Args:
-            t (Union[float, np.ndarray]): Time point(s) at which to evaluate intensity.
-            params (np.ndarray): Parameter vector [β₀, β₁].
-            
-        Returns:
-            Union[float, np.ndarray]: Intensity value(s) at time(s) t.
+            params (np.ndarray): Parameter vector [β₀, β₁, β₂, ..., βₖ].
         """
-        beta0, beta1 = params
+        if len(params) != self.n_covariates + 1:
+            raise ValueError(f"Expected {self.n_covariates + 1} parameters, got {len(params)}")
         
-        # Vectorized implementation
-        if isinstance(t, (list, np.ndarray)):
-            w_t = self.get_covariate_at_time(t)
-            return np.exp(beta0 + beta1 * w_t)
+        beta0 = params[0]
+        betas = params[1:]  # β₁, β₂, ..., βₖ
         
-        # Single point calculation
+        # Get covariate values
         w_t = self.get_covariate_at_time(t)
-        return np.exp(beta0 + beta1 * w_t)
+        
+        if self.n_covariates == 1:
+            # Single covariate (backward compatibility)
+            return np.exp(beta0 + betas[0] * w_t)
+        else:
+            # Multiple covariates
+            if np.isscalar(t):
+                linear_combination = beta0 + np.dot(betas, w_t)
+            else:
+                linear_combination = beta0 + np.dot(w_t, betas)  # Broadcasting
+            return np.exp(linear_combination)
     
     def get_param_count(self) -> int:
-        """
-        Get the number of parameters (2).
-        
-        Returns:
-            int: 2 (for β₀ and β₁).
-        """
-        return 2
-    
+        """Return number of parameters: 1 (intercept) + n_covariates."""
+        return self.n_covariates + 1
+
     def get_param_names(self) -> List[str]:
-        """
-        Get the parameter names.
-        
-        Returns:
-            List[str]: ['beta0', 'beta1'].
-        """
-        return ['beta0', 'beta1']
-    
+        """Return parameter names."""
+        names = ['beta0']
+        for i in range(self.n_covariates):
+            names.append(f'beta{i+1}')
+        return names
+
     def initial_params(self, event_times: np.ndarray, end_time: float) -> np.ndarray:
-        """
-        Generate initial parameter values.
-        
-        Args:
-            event_times (np.ndarray): Array of observed event times.
-            end_time (float): End of observation period.
-            
-        Returns:
-            np.ndarray: [β₀, β₁] where β₀ is log(avg_rate) and β₁ is 0.
-        """
+        """Generate initial parameter values."""
         n_events = len(event_times)
         avg_rate = max(0.1, n_events / end_time)
         beta0_guess = np.log(avg_rate)
-        return np.array([beta0_guess, 0.0])
+        # Start all covariate effects at 0
+        return np.array([beta0_guess] + [0.0] * self.n_covariates)
