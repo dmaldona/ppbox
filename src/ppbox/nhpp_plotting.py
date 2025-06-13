@@ -499,10 +499,13 @@ def plot_empirical_vs_fitted_rates(model: NHPPFitter,
                                    interval_length: Optional[float] = None,
                                    num_intervals: Optional[int] = None,
                                    resolution: int = 100,
+                                   show_confidence: bool = True,
+                                   confidence_level: float = 0.95,
+                                   confidence_method: str = 'transformation',
                                    ax=None,
                                    **plot_kwargs) -> plt.Axes:
     """
-    Plot empirical rates vs fitted intensity function.
+    Plot empirical rates vs fitted intensity function with optional confidence intervals.
     
     Args:
         model: Fitted NHPP model.
@@ -510,7 +513,11 @@ def plot_empirical_vs_fitted_rates(model: NHPPFitter,
         interval_length: Length of intervals for rate calculation.
         num_intervals: Number of intervals (for disjoint method only).
         resolution: Number of points for fitted intensity evaluation.
+        show_confidence: Whether to show confidence intervals for fitted intensity.
+        confidence_level: Confidence level for intervals (default 0.95).
+        confidence_method: Method for CI calculation ('transformation' or 'delta').
         ax: Matplotlib axes.
+        **plot_kwargs: Additional plotting arguments.
         
     Returns:
         matplotlib.axes.Axes: The axes containing the plot.
@@ -540,22 +547,65 @@ def plot_empirical_vs_fitted_rates(model: NHPPFitter,
     # Plot empirical rates
     if plot_type == 'step':
         ax.step(emp_times, emp_rates, where='mid', 
-                label='Empirical Rate', color='black', alpha=0.7)
+                label='Empirical Rate', color='black', alpha=0.8, linewidth=1.5)
     else:
         ax.plot(emp_times, emp_rates, 
-                label='Empirical Rate', color='black', alpha=0.7)
+                label='Empirical Rate', color='black', alpha=0.8, linewidth=1.5)
     
-    # Plot fitted intensity
+    # Plot fitted intensity with confidence intervals
     t_fitted = np.linspace(0, model.end_time, resolution)
     fitted_intensity = model.predict_intensity(t_fitted)
+    
+    # Plot fitted intensity line
     ax.plot(t_fitted, fitted_intensity, 
             label='Fitted Intensity', color='red', linewidth=2)
+    
+    # Add confidence intervals if requested
+    if show_confidence:
+        try:
+            print("caca", confidence_method)
+            lower_ci, upper_ci = model.calculate_intensity_confidence_intervals(
+                times=t_fitted,
+                confidence_level=confidence_level,
+                method=confidence_method
+            )
+            
+            # Plot confidence band
+            ax.fill_between(t_fitted, lower_ci, upper_ci, 
+                          color='red', alpha=0.2, 
+                          label=f'{confidence_level*100:.0f}% Confidence Band')
+            
+            # Optionally plot CI boundaries as lines
+            ax.plot(t_fitted, lower_ci, color='red', linestyle='--', 
+                   alpha=0.6, linewidth=1, label='_nolegend_')
+            ax.plot(t_fitted, upper_ci, color='red', linestyle='--', 
+                   alpha=0.6, linewidth=1, label='_nolegend_')
+                   
+        except Exception as e:
+            warnings.warn(f"Could not calculate confidence intervals: {e}")
     
     # Formatting
     ax.set_xlabel("Time", fontsize=12)
     ax.set_ylabel("Rate / Intensity", fontsize=12)
-    ax.set_title(f"Empirical vs Fitted Rates ({method.title()} Method)", fontsize=14)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    
+    # Enhanced title with method info
+    title_parts = [f"Empirical vs Fitted Rates ({method.title()} Method)"]
+    if show_confidence:
+        title_parts.append(f"with {confidence_level*100:.0f}% CI")
+    ax.set_title(" ".join(title_parts), fontsize=14)
+    
+    # Legend and grid
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3, linestyle='--')
+    
+    # Ensure y-axis starts at 0 or slightly below minimum
+    y_min = min(ax.get_ylim()[0], 0)
+    if show_confidence:
+        # Account for confidence intervals in y-limits
+        try:
+            y_min = min(y_min, np.min(lower_ci) * 0.95)
+        except:
+            pass
+    ax.set_ylim(y_min, ax.get_ylim()[1])
     
     return ax

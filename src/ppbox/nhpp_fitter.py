@@ -741,6 +741,215 @@ class NHPPFitter:
         
         return time_points, empirical_rates
     
+    def calculate_parameter_covariance(self) -> np.ndarray:
+        """
+        Calculate the variance-covariance matrix of fitted parameters.
+        
+        Uses the Fisher Information Matrix approach: Var(β̂) = I(β̂)⁻¹
+        where I(β̂) is the Fisher Information Matrix.
+        
+        Returns:
+            np.ndarray: Variance-covariance matrix of parameters.
+            
+        Raises:
+            RuntimeError: If model has not been fitted.
+            ValueError: If covariance matrix cannot be computed.
+        """
+        if self.fitted_params is None:
+            raise RuntimeError("Model has not been fitted yet.")
+        
+        # Get number of parameters
+        n_params = len(self.fitted_params)
+        
+        # Initialize Fisher Information Matrix
+        fisher_matrix = np.zeros((n_params, n_params))
+        
+        # For log-linear models: ∂log λ(t)/∂β₀ = 1, ∂log λ(t)/∂βᵢ = wᵢ(t)
+        # Fisher Information: I_ij = ∫₀ᵀ λ(t) * (∂log λ/∂βᵢ) * (∂log λ/∂βⱼ) dt
+        
+        # Calculate intensity values at grid points
+        lambda_values = self._intensity_function(self.time_grid, self.fitted_params)
+        
+        # Get gradient of log-likelihood at each time point
+        if hasattr(self.intensity_function, 'n_covariates'):
+            # Multiple covariates case
+            n_covariates = self.intensity_function.n_covariates
+            
+            # Get covariate values at grid points
+            if n_covariates == 1:
+                # Single covariate - backward compatibility
+                w_values = self.intensity_function.get_covariate_at_time(self.time_grid)
+                w_matrix = np.column_stack([np.ones(len(self.time_grid)), w_values])
+            else:
+                # Multiple covariates
+                w_values = self.intensity_function.get_covariate_at_time(self.time_grid)
+                w_matrix = np.column_stack([np.ones(len(self.time_grid)), w_values])
+        else:
+            # Linear intensity case: λ(t) = α + βt
+            # log λ(t) gradients are more complex, need special handling
+            # NOT SUPPORTED YET
+            raise NotImplementedError("Covariance calculation for linear intensity models is not implemented yet.")
+        
+        # Calculate Fisher Information Matrix elements
+        for i in range(n_params):
+            for j in range(i, n_params):  # Only upper triangle, then mirror
+                # I_ij = ∫₀ᵀ λ(t) * (∂log λ/∂βᵢ) * (∂log λ/∂βⱼ) dt
+                integrand = lambda_values * w_matrix[:, i] * w_matrix[:, j]
+                fisher_matrix[i, j] = np.trapz(integrand, self.time_grid)
+                
+                # Mirror to lower triangle
+                if i != j:
+                    fisher_matrix[j, i] = fisher_matrix[i, j]
+        
+        # Invert Fisher Information Matrix to get covariance matrix
+        try:
+            # Try standard matrix inversion
+            cov_matrix = np.linalg.inv(fisher_matrix)
+            cov_method = 'standard_inverse'
+        except np.linalg.LinAlgError:
+            raise ValueError("Cannot compute parameter covariance matrix. "
+                            "Fisher Information Matrix is singular.")
+        
+        # Store method used for debugging
+        if not hasattr(self, '_cov_method'):
+            self._cov_method = cov_method
+        
+        return cov_matrix
+    
+    def calculate_parameter_confidence_intervals(self, 
+                                            confidence_level: float = 0.95) -> pd.DataFrame:
+        """
+        Calculate confidence intervals for model parameters using asymptotic normality.
+        
+        Args:
+            confidence_level (float): Confidence level (default 0.95 for 95% CI).
+            
+        Returns:
+            pd.DataFrame: DataFrame with columns ['Parameter', 'Estimate', 'Std_Error', 
+                        'Lower_CI', 'Upper_CI']
+            
+        Raises:
+            RuntimeError: If model has not been fitted.
+        """
+        if self.fitted_params is None:
+            raise RuntimeError("Model has not been fitted yet.")
+        
+        # Get parameter covariance matrix
+        param_cov = self.calculate_parameter_covariance()
+        
+        # Extract standard errors (square root of diagonal elements)
+        std_errors = np.sqrt(np.diag(param_cov))
+        
+        # Calculate confidence intervals: β̂ᵢ ± z * SE(β̂ᵢ)
+        z_score = scipy.stats.norm.ppf(1 - (1 - confidence_level) / 2)
+        margin = z_score * std_errors
+        
+        lower_ci = self.fitted_params - margin
+        upper_ci = self.fitted_params + margin
+        
+        # Create results DataFrame
+        param_names = self.intensity_function.get_param_names()
+        
+        results_df = pd.DataFrame({
+            'Parameter': param_names,
+            'Estimate': self.fitted_params,
+            'Std_Error': std_errors,
+            'Lower_CI': lower_ci,
+            'Upper_CI': upper_ci
+        })
+        
+        return results_df
+    
+    def calculate_intensity_confidence_intervals(self, 
+                                            times: np.ndarray,
+                                            confidence_level: float = 0.95,
+                                            method: str = 'transformation') -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Calculate confidence intervals for the fitted intensity λ(t).
+        
+        Args:
+            times (np.ndarray): Time points at which to calculate confidence intervals.
+            confidence_level (float): Confidence level (default 0.95 for 95% CI).
+            method (str): Method to use - 'transformation' (default) or 'delta'.
+            
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: (lower_bounds, upper_bounds)
+            
+        Raises:
+            RuntimeError: If model has not been fitted.
+        """
+        if self.fitted_params is None:
+            raise RuntimeError("Model has not been fitted yet.")
+        
+        # Get parameter covariance matrix
+        param_cov = self.calculate_parameter_covariance()
+        
+        # Get fitted intensity values at specified times
+        fitted_intensity = self.predict_intensity(times)
+        
+        # Calculate variance of linear predictor X(t)ᵀβ at each time point
+        linear_predictor_var = np.zeros(len(times))
+        
+        for i, t in enumerate(times):
+            if hasattr(self.intensity_function, 'n_covariates'):
+                # Log-linear case
+                n_covariates = self.intensity_function.n_covariates
+                if n_covariates == 1:
+                    w_t = self.intensity_function.get_covariate_at_time(t)
+                    x_t = np.array([1.0, w_t])  # [1, w(t)]
+                else:
+                    w_t = self.intensity_function.get_covariate_at_time(t)
+                    x_t = np.concatenate([[1.0], w_t])  # [1, w₁(t), w₂(t), ...]
+            else:
+                # Linear case: λ(t) = α + βt
+                # This needs special handling since it's not log-linear
+                x_t = np.array([1.0, t])
+            
+            # Var(X(t)ᵀβ̂) = X(t)ᵀ Var(β̂) X(t)
+            linear_predictor_var[i] = x_t.T @ param_cov @ x_t
+        
+        # Calculate confidence intervals based on method
+        z_score = scipy.stats.norm.ppf(1 - (1 - confidence_level) / 2)
+        
+        if method == 'transformation':
+            # Transformation method (preferred for log-linear models)
+            # CI for log(λ(t)) = log(λ̂(t)) ± z * sqrt(Var(X(t)ᵀβ̂))
+            # Then transform: CI for λ(t) = exp(CI for log(λ(t)))
+            
+            if hasattr(self.intensity_function, 'n_covariates'):
+                # Log-linear case
+                log_intensity = np.log(fitted_intensity)
+                log_margin = z_score * np.sqrt(linear_predictor_var)
+                
+                lower_bounds = np.exp(log_intensity - log_margin)
+                upper_bounds = np.exp(log_intensity + log_margin)
+            else:
+                # Linear case: use delta method since transformation doesn't apply
+                method = 'delta'  # Fall back to delta method
+
+        elif method == 'delta':
+            # Delta method
+            # Var(λ̂(t)) ≈ λ̂(t)² * Var(X(t)ᵀβ̂) for log-linear
+            # For linear case, Var(λ̂(t)) = Var(X(t)ᵀβ̂) directly
+            
+            if hasattr(self.intensity_function, 'n_covariates'):
+                # Log-linear: Var(λ̂(t)) ≈ λ̂(t)² * Var(X(t)ᵀβ̂)
+                intensity_var = fitted_intensity**2 * linear_predictor_var
+            else:
+                # Linear: Var(λ̂(t)) = Var(X(t)ᵀβ̂)
+                intensity_var = linear_predictor_var
+            
+            intensity_std = np.sqrt(intensity_var)
+            margin = z_score * intensity_std
+            
+            lower_bounds = np.maximum(0, fitted_intensity - margin)  # Ensure non-negative
+            upper_bounds = fitted_intensity + margin
+        
+        else:
+            raise ValueError("method must be 'transformation' or 'delta'")
+        
+        return lower_bounds, upper_bounds
+    
     @classmethod
     def create_with_log_linear_intensity(cls, 
                                         event_times: np.ndarray,
