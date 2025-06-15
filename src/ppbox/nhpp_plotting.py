@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scipy.stats
 import warnings
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, List, Union, Dict
 
 from .nhpp_fitter import NHPPFitter
 
@@ -609,3 +609,258 @@ def plot_empirical_vs_fitted_rates(model: NHPPFitter,
     ax.set_ylim(y_min, ax.get_ylim()[1])
     
     return ax
+
+def plot_raw_residuals_vs_time(model: NHPPFitter,
+                              method: str = 'disjoint',
+                              interval_length: Optional[float] = None,
+                              num_intervals: Optional[int] = None,
+                              resolution: int = 100,
+                              residual_type: str = 'raw',
+                              show_confidence_bands: bool = True,
+                              add_lowess: bool = True,
+                              ax=None,
+                              **plot_kwargs) -> plt.Axes:
+    """
+    Plot raw residuals against time.
+    
+    Args:
+        model: Fitted NHPP model.
+        method: 'disjoint' or 'overlapping'.
+        interval_length: Length of intervals.
+        num_intervals: Number of intervals (disjoint only).
+        resolution: Number of points (overlapping only).
+        residual_type: 'raw' or 'pearson'.
+        show_confidence_bands: Whether to show ±2 confidence bands.
+        add_lowess: Whether to add LOWESS smoother.
+        ax: Matplotlib axes.
+        
+    Returns:
+        matplotlib.axes.Axes: The axes containing the plot.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Calculate residuals
+    if method == 'disjoint':
+        if interval_length is None and num_intervals is None:
+            num_intervals = min(20, max(5, model.n_events // 3))
+        residual_data = model.calculate_raw_residuals_disjoint(
+            interval_length=interval_length, 
+            num_intervals=num_intervals,
+            residual_type=residual_type)
+    elif method == 'overlapping':
+        if interval_length is None:
+            interval_length = model.end_time / 10
+        residual_data = model.calculate_raw_residuals_overlapping(
+            interval_length=interval_length,
+            resolution=resolution,
+            residual_type=residual_type)
+    else:
+        raise ValueError("method must be 'disjoint' or 'overlapping'")
+    
+    time_points = residual_data['time_points']
+    residuals = residual_data['residuals']
+    interval_lengths = residual_data['interval_lengths']
+    
+    # Plot residuals
+    ax.scatter(time_points, residuals, alpha=0.7, s=30, **plot_kwargs)
+    
+    # Add zero line
+    ax.axhline(y=0, color='black', linestyle='-', alpha=0.5, linewidth=1)
+    
+    # Add confidence bands
+    if show_confidence_bands:
+        if residual_type == 'pearson':
+            # The bands should depend on the interval length: ±2/sqrt(L)
+            # This matches the reference R code: ic <- 2 / lint**0.5
+            with np.errstate(divide='ignore', invalid='ignore'):
+                half_width = 2.0 / np.sqrt(interval_lengths)
+            
+            upper_band = half_width
+            lower_band = -half_width
+            
+            # Sort for cleaner plotting if using disjoint intervals
+            sort_idx = np.argsort(time_points)
+
+            ax.plot(time_points[sort_idx], upper_band[sort_idx], color='red', linestyle='--', alpha=0.7)
+            ax.plot(time_points[sort_idx], lower_band[sort_idx], color='red', linestyle='--', alpha=0.7)
+            ax.fill_between(time_points[sort_idx], lower_band[sort_idx], upper_band[sort_idx],
+                            color='red', alpha=0.1, label='±2/√L bands')
+        else:
+            # For raw residuals: ±2*sqrt(fitted_rate/interval_length)
+            fitted_rates = residual_data['fitted_rates']
+            upper_band = 2 * np.sqrt(fitted_rates / interval_lengths)
+            lower_band = -upper_band
+            
+            ax.plot(time_points, upper_band, color='red', linestyle='--', alpha=0.7)
+            ax.plot(time_points, lower_band, color='red', linestyle='--', alpha=0.7)
+            ax.fill_between(time_points, lower_band, upper_band, 
+                          color='red', alpha=0.1, label='±2σ bands')
+    
+    # Add LOWESS smoother
+    if add_lowess and len(residuals) > 5:
+        try:
+            from statsmodels.nonparametric.smoothers_lowess import lowess
+            smoothed = lowess(residuals, time_points, frac=0.3)
+            ax.plot(smoothed[:, 0], smoothed[:, 1], color='blue', linewidth=2, 
+                   alpha=0.8, label='LOWESS')
+        except ImportError:
+            warnings.warn("statsmodels not available for LOWESS smoother")
+    
+    # Formatting
+    ax.set_xlabel("Time", fontsize=12)
+    ax.set_ylabel(f"{residual_type.title()} Residuals", fontsize=12)
+    ax.set_title(f"{residual_type.title()} Residuals vs Time ({method.title()} Method)", 
+                fontsize=14)
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.legend()
+    
+    return ax
+
+def plot_lurking_variable_plots(model: NHPPFitter,
+                               covariate_data: Dict[str, np.ndarray],
+                               covariate_times: Optional[np.ndarray] = None,
+                               num_intervals: int = 20,
+                               residual_type: str = 'raw',
+                               show_confidence_bands: bool = True,
+                               time_step: float = 1.0,
+                               figsize: Tuple[float, float] = (12, 8)) -> plt.Figure:
+    """
+    Create lurking variable plots for multiple covariates.
+    
+    Args:
+        model: Fitted NHPP model.
+        covariate_data: Dict with covariate names as keys and values as arrays.
+        covariate_times: Times corresponding to covariate values.
+        num_intervals: Number of intervals to divide covariate range into.
+        residual_type: 'raw' or 'pearson'.
+        show_confidence_bands: Whether to show variable confidence bands.
+        time_step: Duration that each covariate measurement represents.
+        figsize: Figure size.
+        
+    Returns:
+        matplotlib.figure.Figure: Figure containing all lurking variable plots.
+    """
+    n_covariates = len(covariate_data)
+    
+    if n_covariates == 0:
+        raise ValueError("No covariates provided")
+    
+    # Determine subplot layout
+    if n_covariates == 1:
+        nrows, ncols = 1, 1
+    elif n_covariates == 2:
+        nrows, ncols = 1, 2
+    elif n_covariates <= 4:
+        nrows, ncols = 2, 2
+    elif n_covariates <= 6:
+        nrows, ncols = 2, 3
+    elif n_covariates <= 9:
+        nrows, ncols = 3, 3
+    else:
+        nrows, ncols = 4, 3  # For more than 9 covariates
+    
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
+    
+    # Handle single subplot case
+    if n_covariates == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+    
+    for i, (covariate_name, covariate_values) in enumerate(covariate_data.items()):
+        if i >= len(axes):
+            warnings.warn(f"Too many covariates ({n_covariates}). Only plotting first {len(axes)}.")
+            break
+            
+        ax = axes[i]
+        
+        try:
+            # Calculate lurking variable residuals
+            lurking_data = model.calculate_lurking_variable_residuals(
+                covariate_values=covariate_values,
+                covariate_times=covariate_times,
+                num_intervals=num_intervals,
+                residual_type=residual_type,
+                time_step=time_step)
+            
+            covariate_midpoints = lurking_data['covariate_midpoints']
+            residuals = lurking_data['residuals']
+            points_per_bin = lurking_data['points_per_bin']
+            
+            if len(residuals) == 0:
+                ax.text(0.5, 0.5, f'No valid data\nfor {covariate_name}', 
+                       horizontalalignment='center', verticalalignment='center',
+                       transform=ax.transAxes, fontsize=12)
+                ax.set_title(f"Lurking Variable Plot: {covariate_name}", fontsize=12)
+                continue
+            
+            # Plot residuals vs covariate values
+            ax.scatter(covariate_midpoints, residuals, alpha=0.7, s=40, 
+                      color='blue', edgecolors='black', linewidths=0.5)
+            
+            # Add zero line
+            ax.axhline(y=0, color='black', linestyle='-', alpha=0.5, linewidth=1)
+            
+            # Add variable confidence bands based on points per bin
+            if show_confidence_bands:
+                if residual_type == 'pearson':
+                    # Calculate confidence bands: ±2/√(points_per_bin)
+                    # Following NHPoisson's approach: ic <- 2 / lintV**0.5
+                    upper_bands = 2.0 / np.sqrt(points_per_bin)
+                    lower_bands = -upper_bands
+                    
+                    # Sort by covariate value for proper line plotting
+                    sort_idx = np.argsort(covariate_midpoints)
+                    sorted_cov = covariate_midpoints[sort_idx]
+                    sorted_upper = upper_bands[sort_idx]
+                    sorted_lower = lower_bands[sort_idx]
+                    
+                    # Plot confidence bands
+                    ax.plot(sorted_cov, sorted_upper, color='red', linestyle='--', 
+                           alpha=0.7, linewidth=1.5, label='±2/√N bands' if i == 0 else '_nolegend_')
+                    ax.plot(sorted_cov, sorted_lower, color='red', linestyle='--', 
+                           alpha=0.7, linewidth=1.5, label='_nolegend_')
+                    
+                    # Fill between the bands
+                    ax.fill_between(sorted_cov, sorted_lower, sorted_upper, 
+                                  color='red', alpha=0.1)
+                    
+                elif residual_type == 'raw':
+                    # For raw residuals, confidence bands are more complex
+                    # They depend on fitted rates within each bin
+                    # For now, show a warning that this is not implemented
+                    if i == 0:  # Only warn once
+                        warnings.warn("Variable confidence bands for raw residuals not implemented. "
+                                    "Consider using residual_type='pearson' for confidence bands.")
+            
+            # Formatting
+            ax.set_xlabel(covariate_name, fontsize=11)
+            ax.set_ylabel(f"{residual_type.title()} Residuals", fontsize=11)
+            ax.set_title(f"Lurking Variable Plot: {covariate_name}", fontsize=12)
+            ax.grid(True, alpha=0.3, linestyle='--')
+            
+            # Add legend only to first plot to avoid clutter
+            if i == 0 and show_confidence_bands and residual_type == 'pearson':
+                ax.legend(fontsize=10, loc='best')
+            
+        except Exception as e:
+            # Handle errors gracefully
+            ax.text(0.5, 0.5, f'Error calculating\nresiduals for {covariate_name}\n{str(e)}', 
+                   horizontalalignment='center', verticalalignment='center',
+                   transform=ax.transAxes, fontsize=10, color='red')
+            ax.set_title(f"Lurking Variable Plot: {covariate_name} (Error)", fontsize=12)
+            warnings.warn(f"Error calculating lurking variable residuals for {covariate_name}: {e}")
+    
+    # Hide unused subplots
+    for i in range(n_covariates, len(axes)):
+        axes[i].set_visible(False)
+    
+    # Add overall title
+    fig.suptitle(f"Lurking Variable Plots ({residual_type.title()} Residuals)", 
+                fontsize=14, y=0.98)
+    
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.93)  # Make room for suptitle
+    
+    return fig

@@ -949,7 +949,229 @@ class NHPPFitter:
             raise ValueError("method must be 'transformation' or 'delta'")
         
         return lower_bounds, upper_bounds
-    
+        
+    def calculate_raw_residuals_disjoint(self, 
+                                    interval_length: Optional[float] = None,
+                                    num_intervals: Optional[int] = None,
+                                    residual_type: str = 'raw') -> Dict[str, np.ndarray]:
+        """
+        Calculate raw residuals using disjoint intervals.
+        
+        Raw residual = (empirical_rate - fitted_rate) for each interval
+        Pearson residual = raw_residual / sqrt(fitted_rate / interval_length)
+        
+        Args:
+            interval_length: Length of each interval.
+            num_intervals: Number of intervals.
+            residual_type: 'raw' or 'pearson'.
+            
+        Returns:
+            Dict containing: 'residuals', 'time_points', 'empirical_rates', 
+            'fitted_rates', 'interval_lengths'
+        """
+        if self.fitted_params is None:
+            raise RuntimeError("Model has not been fitted yet.")
+        
+        # Get empirical rates (reuse existing method)
+        time_points, empirical_rates = self.calculate_empirical_rates_disjoint(
+            interval_length=interval_length, num_intervals=num_intervals)
+        
+        # Calculate fitted rates at interval midpoints
+        fitted_rates = self.predict_intensity(time_points)
+        
+        # Calculate raw residuals
+        raw_residuals = empirical_rates - fitted_rates
+        
+        # Calculate interval lengths (most will be the same, but last might differ)
+        if interval_length is None:
+            interval_length = self.end_time / len(time_points)
+        interval_lengths = np.full(len(time_points), interval_length)
+        
+        # Adjust last interval if needed
+        if len(time_points) * interval_length > self.end_time:
+            interval_lengths[-1] = self.end_time - (len(time_points) - 1) * interval_length
+        
+        # Calculate scaled residuals if requested
+        if residual_type == 'pearson':
+            # Pearson residuals: standardized by sqrt(variance)
+            # For Poisson: Var = fitted_rate * interval_length / interval_length = fitted_rate
+            residuals = raw_residuals / np.sqrt(fitted_rates / interval_lengths)
+        elif residual_type == 'raw':
+            residuals = raw_residuals
+        else:
+            raise ValueError("residual_type must be 'raw' or 'pearson'")
+        
+        return {
+            'residuals': residuals,
+            'time_points': time_points,
+            'empirical_rates': empirical_rates,
+            'fitted_rates': fitted_rates,
+            'interval_lengths': interval_lengths,
+            'residual_type': residual_type
+        }
+
+    def calculate_raw_residuals_overlapping(self, 
+                                        interval_length: float,
+                                        resolution: int = 100,
+                                        residual_type: str = 'raw') -> Dict[str, np.ndarray]:
+        """
+        Calculate raw residuals using overlapping intervals (sliding window).
+        
+        Args:
+            interval_length: Length of the sliding window.
+            resolution: Number of time points to evaluate at.
+            residual_type: 'raw' or 'pearson'.
+            
+        Returns:
+            Dict containing: 'residuals', 'time_points', 'empirical_rates', 
+            'fitted_rates', 'interval_lengths'
+        """
+        if self.fitted_params is None:
+            raise RuntimeError("Model has not been fitted yet.")
+        
+        # Get empirical rates (reuse existing method)
+        time_points, empirical_rates = self.calculate_empirical_rates_overlapping(
+            interval_length=interval_length, resolution=resolution)
+        
+        # Calculate fitted rates at time points
+        fitted_rates = self.predict_intensity(time_points)
+        
+        # Calculate raw residuals
+        raw_residuals = empirical_rates - fitted_rates
+        
+        # All intervals have the same length for overlapping method
+        interval_lengths = np.full(len(time_points), interval_length)
+        
+        # Calculate scaled residuals if requested
+        if residual_type == 'pearson':
+            residuals = raw_residuals / np.sqrt(fitted_rates / interval_lengths)
+        elif residual_type == 'raw':
+            residuals = raw_residuals
+        else:
+            raise ValueError("residual_type must be 'raw' or 'pearson'")
+        
+        return {
+            'residuals': residuals,
+            'time_points': time_points,
+            'empirical_rates': empirical_rates,
+            'fitted_rates': fitted_rates,
+            'interval_lengths': interval_lengths,
+            'residual_type': residual_type
+        }
+
+    def calculate_lurking_variable_residuals(self, 
+                                        covariate_values: np.ndarray,
+                                        covariate_times: Optional[np.ndarray] = None,
+                                        num_intervals: int = 20,
+                                        residual_type: str = 'raw',
+                                        time_step: float = 1.0) -> Dict[str, np.ndarray]:
+        """
+        Calculate residuals for lurking variable plots.
+        
+        Divides covariate range into quantile-based intervals and calculates
+        residuals for each interval by aggregating over scattered time points.
+        
+        Args:
+            covariate_values: Values of the covariate to analyze.
+            covariate_times: Times corresponding to covariate values. If None,
+                            assumes regular grid from 0 to end_time.
+            num_intervals: Number of intervals to divide covariate range into.
+            residual_type: 'raw' or 'pearson'.
+            time_step: Duration that each covariate measurement represents.
+            
+        Returns:
+            Dict containing: 'residuals', 'covariate_midpoints', 'points_per_bin', 
+                            'interval_bounds', 'residual_type', 'num_valid_intervals'
+        """
+        if self.fitted_params is None:
+            raise RuntimeError("Model has not been fitted yet.")
+        
+        if covariate_times is None:
+            # Create regular grid assuming each measurement represents time_step duration
+            covariate_times = np.arange(0, len(covariate_values) * time_step, time_step)
+            covariate_times = covariate_times[:len(covariate_values)]  # Ensure same length
+        
+        if len(covariate_times) != len(covariate_values):
+            raise ValueError("covariate_times and covariate_values must have same length")
+        
+        # Calculate percentiles to define intervals
+        percentiles = np.linspace(0, 100, num_intervals + 1)
+        interval_bounds = np.percentile(covariate_values, percentiles)
+        
+        # Initialize results
+        residuals = np.full(num_intervals, np.nan)
+        covariate_midpoints = np.full(num_intervals, np.nan)
+        points_per_bin = np.full(num_intervals, 0)
+        
+        for i in range(num_intervals):
+            # Define interval bounds for this covariate bin
+            lower_bound = interval_bounds[i]
+            upper_bound = interval_bounds[i + 1]
+            
+            # Handle edge cases for the last interval
+            if i == num_intervals - 1:
+                mask = (covariate_values >= lower_bound) & (covariate_values <= upper_bound)
+            else:
+                mask = (covariate_values >= lower_bound) & (covariate_values < upper_bound)
+            
+            # Get the number of discrete time points in this bin
+            num_points_in_bin = np.sum(mask)
+            points_per_bin[i] = num_points_in_bin
+            
+            if num_points_in_bin == 0:
+                continue  # Skip empty intervals
+            
+            # Get the specific time points and their corresponding covariate values
+            times_in_bin = covariate_times[mask]
+            
+            # The total exposure time is the number of points times the time step
+            total_exposure_time = num_points_in_bin * time_step
+            
+            # Sum the events over all discrete intervals in the bin
+            total_events = 0
+            for t in times_in_bin:
+                # Count events in the interval [t, t + time_step)
+                events_in_this_interval = np.sum(
+                    (self.event_times >= t) & (self.event_times < t + time_step)
+                )
+                total_events += events_in_this_interval
+            
+            # Sum the FITTED intensity over all points in the bin
+            # This is the sum of intensity values at each time point, multiplied by time_step
+            fitted_intensities_at_points = self.predict_intensity(times_in_bin)
+            total_fitted_intensity = np.sum(fitted_intensities_at_points) * time_step
+            
+            # Calculate the average rates for the entire bin
+            empirical_rate = total_events / total_exposure_time
+            fitted_rate = total_fitted_intensity / total_exposure_time
+            
+            # Calculate the residual
+            raw_residual = empirical_rate - fitted_rate
+            
+            if residual_type == 'pearson':
+                # Pearson residual: standardize by sqrt(fitted_rate / total_exposure_time)
+                if fitted_rate > 0:
+                    residuals[i] = raw_residual / np.sqrt(fitted_rate / total_exposure_time)
+                else:
+                    residuals[i] = np.nan
+            else:
+                residuals[i] = raw_residual
+            
+            # Store midpoint of covariate values in this bin
+            covariate_midpoints[i] = np.mean(covariate_values[mask])
+        
+        # Filter out NaN values
+        valid_mask = ~np.isnan(residuals)
+        
+        return {
+            'residuals': residuals[valid_mask],
+            'covariate_midpoints': covariate_midpoints[valid_mask],
+            'points_per_bin': points_per_bin[valid_mask],
+            'interval_bounds': interval_bounds,
+            'residual_type': residual_type,
+            'num_valid_intervals': np.sum(valid_mask)
+        }
+        
     @classmethod
     def create_with_log_linear_intensity(cls, 
                                         event_times: np.ndarray,
