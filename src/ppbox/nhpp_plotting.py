@@ -864,3 +864,73 @@ def plot_lurking_variable_plots(model: NHPPFitter,
     plt.subplots_adjust(top=0.93)  # Make room for suptitle
     
     return fig
+
+def plot_simulation_based_qqplot(qqplot_data: Dict[str, np.ndarray],
+                               ax=None,
+                               show_envelope: bool = True,
+                               **plot_kwargs) -> plt.Axes:
+    """
+    Plot simulation-based QQ plot for residual diagnostics.
+    
+    Args:
+        qqplot_data: Output from calculate_simulation_based_residual_qqplot()
+        ax: Matplotlib axes. If None, creates new figure.
+        show_envelope: Whether to show confidence envelope.
+        **plot_kwargs: Additional arguments for plotting.
+        
+    Returns:
+        matplotlib.axes.Axes: The axes containing the plot.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # Extract data
+    sorted_residuals = qqplot_data['sorted_residuals']
+    expected_quantiles = qqplot_data['expected_quantiles']
+    
+    # Main QQ plot
+    ax.scatter(expected_quantiles, sorted_residuals, 
+              alpha=0.7, s=40, color='blue', 
+              edgecolors='black', linewidths=0.5,
+              label='Observed', **plot_kwargs)
+    
+    # Add y=x reference line
+    lims = [
+        np.min([ax.get_xlim(), ax.get_ylim()]),
+        np.max([ax.get_xlim(), ax.get_ylim()]),
+    ]
+    ax.plot(lims, lims, 'r--', alpha=0.75, zorder=0, label='y=x')
+    
+    # Add confidence envelope if requested
+    if show_envelope:
+        lower_env = qqplot_data['lower_envelope']
+        upper_env = qqplot_data['upper_envelope']
+        confidence_level = qqplot_data['confidence_level']
+        
+        # Sort by expected quantiles for smooth plotting
+        sort_idx = np.argsort(expected_quantiles)
+        
+        ax.plot(expected_quantiles[sort_idx], lower_env[sort_idx], 
+               'g--', alpha=0.5, linewidth=1.5)
+        ax.plot(expected_quantiles[sort_idx], upper_env[sort_idx], 
+               'g--', alpha=0.5, linewidth=1.5)
+        ax.fill_between(expected_quantiles[sort_idx], 
+                       lower_env[sort_idx], upper_env[sort_idx],
+                       alpha=0.2, color='green', 
+                       label=f'{confidence_level*100:.0f}% Envelope')
+    
+    # Formatting
+    ax.set_xlabel('Expected Quantiles (from simulations)', fontsize=12)
+    ax.set_ylabel('Observed Residual Quantiles', fontsize=12)
+    ax.set_title('Simulation-Based Residual QQ Plot', fontsize=14)
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.legend(loc='best')
+    ax.set_aspect('equal', 'box')
+    
+    # Add text with simulation info
+    n_sims = qqplot_data.get('n_simulations', 'Unknown')
+    ax.text(0.05, 0.95, f'Based on {n_sims} simulations',
+           transform=ax.transAxes, verticalalignment='top',
+           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    return ax

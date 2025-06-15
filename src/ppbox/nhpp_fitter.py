@@ -1171,6 +1171,422 @@ class NHPPFitter:
             'residual_type': residual_type,
             'num_valid_intervals': np.sum(valid_mask)
         }
+    
+    def simulate_batch(self, 
+                    sim_params: np.ndarray,
+                    duration: float,
+                    n_simulations: int,
+                    max_attempts: int = 1000,
+                    random_seed: Optional[int] = None,
+                    show_progress: bool = False) -> List[np.ndarray]:
+        """
+        Simulate multiple event time trajectories.
+        
+        Args:
+            sim_params: Parameter vector for simulation.
+            duration: Time duration for each simulation.
+            n_simulations: Number of trajectories to simulate.
+            max_attempts: Maximum root-finding attempts per event.
+            random_seed: Seed for reproducibility.
+            show_progress: Whether to show progress bar.
+            
+        Returns:
+            List[np.ndarray]: List of simulated event time arrays.
+        """
+        if random_seed is not None:
+            np.random.seed(random_seed)
+        
+        if show_progress:
+            try:
+                from tqdm.auto import tqdm
+                iterator = tqdm(range(n_simulations), desc="Simulating trajectories")
+            except ImportError:
+                iterator = range(n_simulations)
+        else:
+            iterator = range(n_simulations)
+        
+        trajectories = []
+        for _ in iterator:
+            trajectory = self.simulate(sim_params, duration, max_attempts)
+            trajectories.append(trajectory)
+        
+        return trajectories
+
+    def calculate_simulation_based_residual_qqplot(self,
+                                                residual_method: str = 'disjoint',
+                                                n_simulations: int = 100,
+                                                confidence_level: float = 0.95,
+                                                interval_length: Optional[float] = None,
+                                                num_intervals: Optional[int] = None,
+                                                residual_type: str = 'pearson',
+                                                fit_method: str = 'BFGS',
+                                                fit_options: Optional[Dict[str, Any]] = None,
+                                                random_seed: Optional[int] = None,
+                                                show_progress: bool = True,
+                                                n_cores: int = 1) -> Dict[str, np.ndarray]:
+        """
+        Calculate simulation-based QQ plot data for residual diagnostics.
+        
+        This method:
+        1. Simulates multiple datasets from the fitted model
+        2. Fits a new model to each simulated dataset
+        3. Calculates residuals for each fitted model
+        4. Compares observed residuals against the distribution of simulated residuals
+        
+        Args:
+            residual_method: 'disjoint' or 'overlapping' residuals.
+            n_simulations: Number of simulations to perform.
+            confidence_level: Confidence level for envelopes (e.g., 0.95).
+            interval_length: Length of intervals for residual calculation.
+            num_intervals: Number of intervals (disjoint method only).
+            residual_type: 'raw' or 'pearson' residuals.
+            fit_method: Optimization method for refitting models.
+            fit_options: Options for the optimizer.
+            random_seed: Seed for reproducibility.
+            show_progress: Whether to show progress bar.
+            n_cores: Number of cores for parallel processing (not implemented yet).
+            
+        Returns:
+            Dict containing:
+                'observed_residuals': Original residuals from fitted model
+                'expected_quantiles': Expected quantiles under the model
+                'lower_envelope': Lower confidence envelope
+                'upper_envelope': Upper confidence envelope
+                'sorted_residuals': Sorted observed residuals for plotting
+        """
+        if self.fitted_params is None:
+            raise RuntimeError("Model must be fitted before running simulation-based QQ plot.")
+        
+        if random_seed is not None:
+            np.random.seed(random_seed)
+        
+        # Set default intervals if not provided
+        if residual_method == 'disjoint':
+            if interval_length is None and num_intervals is None:
+                # Default: use approximately 20 intervals or at least 5 based on number of events
+                num_intervals = min(20, max(5, self.n_events // 3))
+        elif residual_method == 'overlapping':
+            if interval_length is None:
+                interval_length = self.end_time / 10
+        
+        # Calculate observed residuals
+        if residual_method == 'disjoint':
+            obs_residual_data = self.calculate_raw_residuals_disjoint(
+                interval_length=interval_length,
+                num_intervals=num_intervals,
+                residual_type=residual_type
+            )
+        elif residual_method == 'overlapping':
+            obs_residual_data = self.calculate_raw_residuals_overlapping(
+                interval_length=interval_length,
+                residual_type=residual_type
+            )
+        else:
+            raise ValueError("residual_method must be 'disjoint' or 'overlapping'")
+        
+        observed_residuals = obs_residual_data['residuals']
+        n_residuals = len(observed_residuals)
+        
+        if n_residuals < 2:
+            raise ValueError("Not enough residuals for QQ plot analysis.")
+        
+        # Sort observed residuals for QQ plot
+        sorted_observed = np.sort(observed_residuals)
+        
+        # Default fit options for simulations
+        if fit_options is None:
+            fit_options = {'disp': False}
+        
+        # Store residuals from all simulations
+        all_simulated_residuals = []
+        
+        # Progress tracking
+        if show_progress:
+            try:
+                from tqdm.auto import tqdm
+                iterator = tqdm(range(n_simulations), desc="Simulating and fitting")
+            except ImportError:
+                iterator = range(n_simulations)
+                warnings.warn("tqdm not available. Install with 'pip install tqdm' for progress bars.")
+        else:
+            iterator = range(n_simulations)
+        
+        successful_sims = 0
+        
+        for _ in iterator:
+            try:
+                # 1. Simulate new trajectory from fitted model
+                sim_events = self.simulate(self.fitted_params, self.end_time)
+                
+                # Skip if no events generated
+                if len(sim_events) == 0:
+                    continue
+                
+                # 2. Create new fitter with simulated data
+                sim_fitter = NHPPFitter(
+                    event_times=sim_events,
+                    intensity_function=copy.deepcopy(self.intensity_function),
+                    end_time=self.end_time,
+                    grid_size=self.grid_size,
+                    discrete_time=self.discrete_time
+                )
+                
+                # 3. Fit model to simulated data
+                result = sim_fitter.fit(
+                    initial_params=self.fitted_params,  # Use fitted params as initial guess
+                    method=fit_method,
+                    options=fit_options,
+                    verbose=False
+                )
+                
+                if result.success:
+                    # 4. Calculate residuals from simulated data
+                    if residual_method == 'disjoint':
+                        sim_residual_data = sim_fitter.calculate_raw_residuals_disjoint(
+                            interval_length=interval_length,
+                            num_intervals=num_intervals,
+                            residual_type=residual_type
+                        )
+                    else:
+                        sim_residual_data = sim_fitter.calculate_raw_residuals_overlapping(
+                            interval_length=interval_length,
+                            residual_type=residual_type
+                        )
+                    
+                    sim_residuals = sim_residual_data['residuals']
+                    
+                    # Ensure same number of residuals (might differ slightly due to events)
+                    if len(sim_residuals) >= n_residuals:
+                        # Sort and take first n_residuals values
+                        sorted_sim_residuals = np.sort(sim_residuals)[:n_residuals]
+                    else:
+                        # Pad with NaN if fewer residuals
+                        sorted_sim_residuals = np.full(n_residuals, np.nan)
+                        sorted_sim_residuals[:len(sim_residuals)] = np.sort(sim_residuals)
+                    
+                    all_simulated_residuals.append(sorted_sim_residuals)
+                    successful_sims += 1
+                    
+            except Exception as e:
+                warnings.warn(f"Simulation failed: {e}")
+                continue
+        
+        if successful_sims == 0:
+            raise RuntimeError("All simulations failed.")
+        
+        if show_progress:
+            print(f"Successfully completed {successful_sims}/{n_simulations} simulations.")
+        
+        # Convert to array for easier manipulation
+        simulated_residuals_array = np.array(all_simulated_residuals)
+        
+        # Calculate expected quantiles and envelopes for each order statistic
+        expected_quantiles = np.nanmean(simulated_residuals_array, axis=0)
+        
+        # Calculate confidence envelopes
+        alpha = 1 - confidence_level
+        lower_quantile = alpha / 2
+        upper_quantile = 1 - alpha / 2
+        
+        lower_envelope = np.nanpercentile(simulated_residuals_array, lower_quantile * 100, axis=0)
+        upper_envelope = np.nanpercentile(simulated_residuals_array, upper_quantile * 100, axis=0)
+        
+        return {
+            'observed_residuals': observed_residuals,
+            'sorted_residuals': sorted_observed,
+            'expected_quantiles': expected_quantiles,
+            'lower_envelope': lower_envelope,
+            'upper_envelope': upper_envelope,
+            'n_simulations': successful_sims,
+            'confidence_level': confidence_level,
+            'residual_method': residual_method,
+            'residual_type': residual_type
+        }
+
+    def simulate_inference(self,
+                        statistic_func: callable,
+                        duration: Optional[float] = None,
+                        n_simulations: int = 1000,
+                        confidence_level: float = 0.95,
+                        func_args: Optional[Dict[str, Any]] = None,
+                        random_seed: Optional[int] = None,
+                        show_progress: bool = True) -> Dict[str, Any]:
+        """
+        Perform simulation-based inference for arbitrary statistics.
+        
+        This function simulates multiple trajectories from the fitted model and
+        calculates a user-defined statistic for each trajectory. It returns the
+        mean value and confidence envelope for the statistic.
+        
+        Args:
+            statistic_func: Function that takes event times array and returns a scalar.
+                        Signature: func(event_times, **func_args) -> scalar
+            duration: Duration for simulation. If None, uses self.end_time.
+            n_simulations: Number of simulations to perform.
+            confidence_level: Confidence level for envelope (e.g., 0.95 for 95%).
+            func_args: Additional arguments to pass to statistic_func.
+            random_seed: Seed for reproducibility.
+            show_progress: Whether to show progress bar.
+            
+        Returns:
+            Dict containing:
+                'mean': Mean value of the statistic
+                'median': Median value of the statistic
+                'lower_bound': Lower confidence bound
+                'upper_bound': Upper confidence bound
+                'values': All simulated values (for custom analysis)
+                'n_valid': Number of valid (non-NaN) results
+                
+        Examples:
+            # Number of events in a time period
+            result = model.simulate_inference(
+                statistic_func=lambda events: len(events),
+                duration=30
+            )
+            
+            # Time of kth event
+            def kth_event_time(events, k=5):
+                return events[k-1] if len(events) >= k else np.nan
+            
+            result = model.simulate_inference(
+                statistic_func=kth_event_time,
+                func_args={'k': 5}
+            )
+        """
+        if self.fitted_params is None:
+            raise RuntimeError("Model must be fitted before running inference.")
+        
+        if duration is None:
+            duration = self.end_time
+        
+        if func_args is None:
+            func_args = {}
+        
+        if random_seed is not None:
+            np.random.seed(random_seed)
+        
+        # Simulate trajectories
+        trajectories = self.simulate_batch(
+            sim_params=self.fitted_params,
+            duration=duration,
+            n_simulations=n_simulations,
+            show_progress=show_progress
+        )
+        
+        # Calculate statistic for each trajectory
+        statistic_values = []
+        
+        for trajectory in trajectories:
+            try:
+                value = statistic_func(trajectory, **func_args)
+                statistic_values.append(value)
+            except Exception as e:
+                # Handle cases where statistic cannot be calculated
+                statistic_values.append(np.nan)
+        
+        # Convert to array and remove NaNs for statistics
+        values_array = np.array(statistic_values)
+        valid_values = values_array[~np.isnan(values_array)]
+        n_valid = len(valid_values)
+        
+        if n_valid == 0:
+            warnings.warn("No valid statistics could be calculated from simulations.")
+            return {
+                'mean': np.nan,
+                'median': np.nan,
+                'lower_bound': np.nan,
+                'upper_bound': np.nan,
+                'values': values_array,
+                'n_valid': 0
+            }
+        
+        # Calculate summary statistics
+        mean_value = np.mean(valid_values)
+        median_value = np.median(valid_values)
+        
+        # Calculate confidence bounds
+        alpha = 1 - confidence_level
+        lower_percentile = (alpha / 2) * 100
+        upper_percentile = (1 - alpha / 2) * 100
+        
+        lower_bound = np.percentile(valid_values, lower_percentile)
+        upper_bound = np.percentile(valid_values, upper_percentile)
+        
+        if show_progress and n_valid < n_simulations:
+            print(f"Valid simulations: {n_valid}/{n_simulations}")
+        
+        return {
+            'mean': mean_value,
+            'median': median_value,
+            'lower_bound': lower_bound,
+            'upper_bound': upper_bound,
+            'values': values_array,
+            'n_valid': n_valid,
+            'confidence_level': confidence_level
+        }
+
+
+    # Convenience methods for common statistics
+    def predict_event_count(self, 
+                        start_time: float = 0,
+                        end_time: Optional[float] = None,
+                        n_simulations: int = 1000,
+                        confidence_level: float = 0.95,
+                        **kwargs) -> Dict[str, Any]:
+        """
+        Predict the number of events in a time interval.
+        
+        Args:
+            start_time: Start of prediction interval.
+            end_time: End of prediction interval (defaults to self.end_time).
+            n_simulations: Number of simulations.
+            confidence_level: Confidence level for prediction interval.
+            **kwargs: Additional arguments passed to simulate_inference.
+            
+        Returns:
+            Dict with mean, median, and prediction interval for event count.
+        """
+        if end_time is None:
+            end_time = self.end_time
+        
+        def count_in_interval(events):
+            return np.sum((events >= start_time) & (events <= end_time))
+        
+        return self.simulate_inference(
+            statistic_func=count_in_interval,
+            duration=end_time,
+            n_simulations=n_simulations,
+            confidence_level=confidence_level,
+            **kwargs
+        )
+
+
+    def predict_time_to_kth_event(self,
+                                k: int,
+                                n_simulations: int = 1000,
+                                confidence_level: float = 0.95,
+                                **kwargs) -> Dict[str, Any]:
+        """
+        Predict the time until the kth event occurs.
+        
+        Args:
+            k: Which event to predict (1 for first event, etc.).
+            n_simulations: Number of simulations.
+            confidence_level: Confidence level for prediction interval.
+            **kwargs: Additional arguments passed to simulate_inference.
+            
+        Returns:
+            Dict with mean, median, and prediction interval for time to kth event.
+        """
+        def time_of_kth_event(events):
+            return events[k-1] if len(events) >= k else np.nan
+        
+        return self.simulate_inference(
+            statistic_func=time_of_kth_event,
+            n_simulations=n_simulations,
+            confidence_level=confidence_level,
+            **kwargs
+        )
         
     @classmethod
     def create_with_log_linear_intensity(cls, 
